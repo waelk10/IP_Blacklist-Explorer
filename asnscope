@@ -1,0 +1,360 @@
+#!/bin/sh
+# Copyright (C) 2026 Wael Karram
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# asnscope -- refresh, analyse and visualise a blacklist of abusive IPs/ASNs.
+#
+# POSIX shell + awk for the data path, GNU Octave for the drawings.
+# No Python, no JavaScript, no database, no service to keep running.
+#
+# Usage: ./asnscope [all|refresh|analyze|render|report] [options]
+#        ./asnscope --help
+
+set -eu
+
+VERSION=0.1.0
+LC_ALL=C
+export LC_ALL
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+LIB="$SELF_DIR/lib"
+SHARE="$SELF_DIR/share"
+
+REPO_URL=${ASNSCOPE_REPO:-https://github.com/waelk10/IP_Blacklist}
+CACHE=${ASNSCOPE_CACHE:-$SELF_DIR/.cache}
+REPO_DIR="$CACHE/IP_Blacklist"
+OUT=${ASNSCOPE_OUT:-$SELF_DIR/out}
+STATE="$SELF_DIR/state"
+OFFLINE=0
+TAB=$(printf '\t')
+
+say()  { printf '%s\n' "$*" >&2; }
+die()  { printf 'asnscope: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+asnscope $VERSION -- blacklist intelligence for ASNs
+
+Usage:
+  ./asnscope                 refresh, analyse and render (same as "all")
+  ./asnscope refresh         clone or update the upstream repository
+  ./asnscope analyze         parse the lists and build the data tables
+  ./asnscope render          draw the dashboard (needs octave-cli)
+  ./asnscope report          print the text report only
+  ./asnscope all             refresh + analyze + render
+
+Options:
+  --repo URL     upstream git repository
+                 (default: $REPO_URL)
+  --out DIR      output directory (default: $OUT)
+  --offline      do not touch the network; use the cached clone
+  --no-viz       skip Octave and only produce tables/report
+  -V, --version  print the version
+  -h, --help     this text
+
+Environment: ASNSCOPE_REPO, ASNSCOPE_CACHE, ASNSCOPE_OUT
+
+Output:
+  out/dashboard.html   self-contained dashboard (static HTML + inline SVG)
+  out/report.txt       plain text report for terminals and mail
+  out/asn_stats.tsv    per-ASN statistics
+  out/edges.tsv        ASN-to-ASN relations
+  out/owners.tsv       operator groups
+EOF
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+refresh_repo() {
+    need git
+    mkdir -p "$CACHE"
+
+    if [ -d "$REPO_DIR/.git" ]; then
+        if [ "$OFFLINE" -eq 1 ]; then
+            say "offline: using cached clone"
+            return 0
+        fi
+        say "updating $REPO_DIR"
+        if git -C "$REPO_DIR" fetch --depth=1 --quiet origin 2>/dev/null; then
+            git -C "$REPO_DIR" reset --hard --quiet FETCH_HEAD 2>/dev/null || true
+        else
+            say "warning: update failed; using the cached clone"
+        fi
+        return 0
+    fi
+
+    [ "$OFFLINE" -eq 1 ] && die "no cached clone at $REPO_DIR (run without --offline first)"
+    say "cloning $REPO_URL"
+    rm -rf "$CACHE/.clone.$$"
+    if ! git clone --depth 1 --quiet "$REPO_URL" "$CACHE/.clone.$$"; then
+        rm -rf "$CACHE/.clone.$$"
+        die "git clone failed"
+    fi
+    if [ -e "$REPO_DIR" ]; then
+        die "$REPO_DIR exists but is not a git clone; move it away"
+    fi
+    mv "$CACHE/.clone.$$" "$REPO_DIR"
+}
+
+repo_commit() {
+    git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || printf 'unknown'
+}
+
+repo_date() {
+    git -C "$REPO_DIR" log -1 --format=%cI 2>/dev/null || printf 'unknown'
+}
+
+analyze() {
+    need awk
+    need sort
+    need git
+    DATA="$REPO_DIR/ip_banlists"
+    [ -d "$DATA" ] || die "no ip_banlists/ in $REPO_DIR (run refresh first)"
+    mkdir -p "$OUT" "$STATE"
+
+    TMP="$OUT/.tmp.$$"
+    rm -rf "$TMP"
+    mkdir -p "$TMP"
+
+    say "parsing ASN lists"
+    set -- "$DATA"/AS*
+    [ -e "$1" ] || die "no AS* files in $DATA"
+    awk -f "$LIB/extract.awk" "$@" > "$TMP/raw0.tsv"
+    sort -t "$TAB" -k1,1 -k4,4n "$TMP/raw0.tsv" > "$TMP/raw.tsv"
+    UNIQUE_CIDRS=$(cut -f3 "$TMP/raw.tsv" | sort -u | wc -l | tr -d ' ')
+    awk -F'\t' 'BEGIN { OFS = "\t" }
+                { l = $6 + 0; c[l]++; a[l] += $5 - $4 + 1 }
+                END { for (l = 0; l <= 32; l++) if (c[l]) print l, c[l], a[l] }' \
+        "$TMP/raw.tsv" > "$TMP/prefix_hist.tsv"
+
+    awk -f "$LIB/merge.awk" \
+        -v merged="$TMP/merged0.tsv" -v meta="$TMP/meta_raw.tsv" "$TMP/raw.tsv"
+
+    # ASN numbers that exist as files but have an empty list still count as
+    # tracked; give them a zero row so the numbers reconcile.
+    for f in "$@"; do
+        base=$(basename "$f")
+        asn=$(printf '%s' "$base" | sed -n 's/^AS\([0-9][0-9]*\)_.*/\1/p')
+        slug=$(printf '%s' "$base" | sed -n 's/^AS[0-9][0-9]*_//p')
+        [ -n "$asn" ] && printf '%s\t%s\n' "$asn" "$slug"
+    done | sort -t "$TAB" -u -k1,1 > "$TMP/asns_all.tsv"
+
+    cp "$TMP/meta_raw.tsv" "$TMP/meta.tsv"
+    awk -F'\t' 'NR==FNR { seen[$1] = 1; next }
+                !($1 in seen) { print $1 "\t" $2 "\t\t0\t0\t0\t0\t0" }' \
+        "$TMP/meta_raw.tsv" "$TMP/asns_all.tsv" >> "$TMP/meta.tsv"
+    awk -F'\t' '$6 == 0 { print $1 "\t" $2 "\t" $4 }' "$TMP/meta.tsv" > "$TMP/empty.tsv"
+
+    sort -t "$TAB" -k2,2n "$TMP/merged0.tsv" > "$TMP/merged_sorted.tsv"
+
+    say "computing coverage and relations"
+    awk -f "$LIB/union.awk" "$TMP/merged_sorted.tsv" > "$TMP/union.txt"
+    read -r UNION UNION_RANGES < "$TMP/union.txt"
+
+    awk -F'\t' '{ print $2 "\t+1"; print ($3 + 1) "\t-1" }' "$TMP/merged_sorted.tsv" |
+        sort -t "$TAB" -k1,1n -k2,2n |
+        awk -f "$LIB/depth.awk" > "$TMP/depth.txt"
+    read -r OVERLAP MAXDEPTH < "$TMP/depth.txt"
+
+    sort -t "$TAB" -k3,3 "$TMP/raw.tsv" | awk -f "$LIB/exact.awk" > "$TMP/exact.tsv"
+
+    awk -v meta="$TMP/meta.tsv" -v exact="$TMP/exact.tsv" -f "$LIB/edges.awk" \
+        "$TMP/merged_sorted.tsv" |
+        sort -t "$TAB" -k3,3nr > "$TMP/edges.tsv"
+
+    awk -v total="$UNION" -f "$LIB/stats.awk" "$TMP/meta.tsv" "$TMP/edges.tsv" |
+        sort -t "$TAB" -k6,6nr |
+        awk -F'\t' 'BEGIN { OFS = "\t" } { print NR, $0 }' > "$TMP/asn_stats.tsv"
+
+    awk -f "$LIB/owners.awk" "$TMP/asn_stats.tsv" |
+        sort -t "$TAB" -k3,3nr > "$TMP/owners.tsv"
+
+    # --- service lists -------------------------------------------------
+    say "attributing service lists"
+    : > "$TMP/service_asn.tsv"
+    : > "$TMP/service_channel.tsv"
+    for f in "$DATA"/*; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f")
+        case "$base" in
+            AS[0-9]*_*|combined_list|combined_list_no_f2b|timestamp|append_*|*.xz|*.tar*)
+                continue ;;
+        esac
+        awk -v merged="$TMP/merged_sorted.tsv" -v chfile="$TMP/ch.tsv" \
+            -f "$LIB/coverage.awk" "$f" >> "$TMP/service_asn.tsv"
+        cat "$TMP/ch.tsv" >> "$TMP/service_channel.tsv"
+    done
+    awk -F'\t' '$2 > 0' "$TMP/service_channel.tsv" > "$TMP/channels.tmp"
+    mv "$TMP/channels.tmp" "$TMP/service_channel.tsv"
+
+    if [ -f "$DATA/combined_list" ]; then
+        awk -v merged="$TMP/merged_sorted.tsv" -v chfile="$TMP/combined_channel.tsv" \
+            -f "$LIB/coverage.awk" "$DATA/combined_list" > "$TMP/combined_asn.tsv"
+    else
+        printf 'combined_list\t0\t0\t0.0\n' > "$TMP/combined_channel.tsv"
+    fi
+
+    # --- comparison with the previous run ------------------------------
+    : > "$TMP/delta.tsv"
+    HAS_PREV=0
+    if [ -f "$STATE/last_stats.tsv" ]; then
+        HAS_PREV=1
+        awk -f "$LIB/delta.awk" "$STATE/last_stats.tsv" "$TMP/asn_stats.tsv" |
+            awk -F'\t' 'BEGIN { OFS = "\t" } { d = $5; if (d < 0) d = -d; print $0, d }' |
+            sort -t "$TAB" -k9,9nr | cut -f1-8 > "$TMP/delta.tsv"
+    fi
+
+    # --- publish -------------------------------------------------------
+    for f in raw.tsv meta.tsv merged_sorted.tsv exact.tsv edges.tsv \
+             asn_stats.tsv owners.tsv service_asn.tsv service_channel.tsv \
+             combined_channel.tsv combined_asn.tsv delta.tsv prefix_hist.tsv empty.tsv; do
+        case "$f" in
+            raw.tsv|merged_sorted.tsv) continue ;;
+        esac
+        [ -f "$TMP/$f" ] && cp "$TMP/$f" "$OUT/$f"
+    done
+
+    ASN_TOTAL=$(wc -l < "$TMP/asns_all.tsv" | tr -d ' ')
+    ASN_ACTIVE=$(awk -F'\t' '$7 > 0' "$TMP/asn_stats.tsv" | wc -l | tr -d ' ')
+    PREFIXES=$(wc -l < "$TMP/raw.tsv" | tr -d ' ')
+    EDGES=$(wc -l < "$TMP/edges.tsv" | tr -d ' ')
+    EXACT=$(wc -l < "$TMP/exact.tsv" | tr -d ' ')
+    MULTI=$(awk -F'\t' '$2 > 1' "$TMP/owners.tsv" | wc -l | tr -d ' ')
+    CHANNELS=$(wc -l < "$TMP/service_channel.tsv" | tr -d ' ')
+    read -r _ C_TOTAL C_MATCHED C_PCT < "$TMP/combined_channel.tsv"
+    NEW=$(awk -F'\t' '$3=="new"' "$TMP/delta.tsv" | wc -l | tr -d ' ')
+    GREW=$(awk -F'\t' '$3=="grew"' "$TMP/delta.tsv" | wc -l | tr -d ' ')
+    SHRANK=$(awk -F'\t' '$3=="shrank"' "$TMP/delta.tsv" | wc -l | tr -d ' ')
+    LOST=$(awk -F'\t' '$3=="lost"' "$TMP/delta.tsv" | wc -l | tr -d ' ')
+    OVERLAP_PCT=$(awk -v o="$OVERLAP" -v u="$UNION" 'BEGIN { printf "%.2f", (u > 0 ? 100*o/u : 0) }')
+
+    RUN_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    UPSTREAM=$(cat "$DATA/timestamp" 2>/dev/null || printf 'unknown')
+    COMMIT=$(repo_commit)
+    COMMIT_DATE=$(repo_date)
+
+    {
+        printf 'run_utc\t%s\n' "$RUN_UTC"
+        printf 'repo_url\t%s\n' "$REPO_URL"
+        printf 'repo_commit\t%s\n' "$COMMIT"
+        printf 'repo_commit_date\t%s\n' "$COMMIT_DATE"
+        printf 'upstream_timestamp\t%s\n' "$UPSTREAM"
+        printf 'asns_total\t%s\n' "$ASN_TOTAL"
+        printf 'asns_active\t%s\n' "$ASN_ACTIVE"
+        printf 'asns_empty\t%s\n' "$((ASN_TOTAL - ASN_ACTIVE))"
+        printf 'prefixes\t%s\n' "$PREFIXES"
+        printf 'unique_cidrs\t%s\n' "$UNIQUE_CIDRS"
+        printf 'has_previous\t%s\n' "$HAS_PREV"
+        printf 'ranges\t%s\n' "$(wc -l < "$TMP/merged_sorted.tsv" | tr -d ' ')"
+        printf 'union_addresses\t%s\n' "$UNION"
+        printf 'union_ranges\t%s\n' "$UNION_RANGES"
+        printf 'overlap_addresses\t%s\n' "$OVERLAP"
+        printf 'overlap_pct\t%s\n' "$OVERLAP_PCT"
+        printf 'max_depth\t%s\n' "$MAXDEPTH"
+        printf 'edges\t%s\n' "$EDGES"
+        printf 'shared_prefix_pairs\t%s\n' "$EXACT"
+        printf 'owner_groups_multi\t%s\n' "$MULTI"
+        printf 'channels\t%s\n' "$CHANNELS"
+        printf 'combined_total\t%s\n' "$C_TOTAL"
+        printf 'combined_matched\t%s\n' "$C_MATCHED"
+        printf 'combined_pct\t%s\n' "$C_PCT"
+        printf 'delta_new\t%s\n' "$NEW"
+        printf 'delta_grew\t%s\n' "$GREW"
+        printf 'delta_shrank\t%s\n' "$SHRANK"
+        printf 'delta_lost\t%s\n' "$LOST"
+    } > "$OUT/summary.tsv"
+
+    awk -F'\t' '{ print ($5 - $4 + 1) "\t" $1 "\t" $2 "\t" $3 }' "$TMP/raw.tsv" |
+        sort -t "$TAB" -k1,1nr | sed -n '1,10p' > "$OUT/big_prefixes.tsv"
+
+    awk -v summary="$OUT/summary.tsv" -v stats="$OUT/asn_stats.tsv" \
+        -v edges="$OUT/edges.tsv" -v owners="$OUT/owners.tsv" \
+        -v channels="$OUT/service_channel.tsv" -v service="$OUT/service_asn.tsv" \
+        -v bigprefix="$OUT/big_prefixes.tsv" \
+        -f "$LIB/insights.awk" > "$OUT/insights.tsv"
+
+    # state for the next delta
+    cp "$TMP/asn_stats.tsv" "$STATE/last_stats.tsv"
+    cp "$OUT/summary.tsv" "$STATE/last_summary.tsv"
+    if [ ! -f "$STATE/history.tsv" ]; then
+        printf 'run_utc\tasns\tprefixes\tunion\toverlap\n' > "$STATE/history.tsv"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$RUN_UTC" "$ASN_ACTIVE" "$PREFIXES" "$UNION" "$OVERLAP" \
+        >> "$STATE/history.tsv"
+
+    rm -rf "$TMP"
+
+    say "analyzed $ASN_ACTIVE active ASNs, $PREFIXES prefixes, $EDGES relation(s)"
+}
+
+find_octave() {
+    if command -v octave-cli >/dev/null 2>&1; then
+        printf 'octave-cli'
+    elif command -v octave >/dev/null 2>&1; then
+        printf 'octave'
+    else
+        return 1
+    fi
+}
+
+render() {
+    [ -f "$OUT/asn_stats.tsv" ] || die "no analysis in $OUT (run analyze first)"
+    OCT=$(find_octave) || die "GNU Octave not found (install octave or use --no-viz)"
+    say "drawing with $OCT"
+    OLOG="$OUT/.octave.$$.log"
+    if ! "$OCT" --quiet --no-window-system --eval \
+        "addpath('$LIB'); render_dashboard('$OUT', '$SHARE');" 2>"$OLOG"; then
+        cat "$OLOG" >&2
+        rm -f "$OLOG"
+        die "Octave rendering failed"
+    fi
+    # Octave 8.4 on this distribution always emits this line at exit; drop it.
+    grep -v 'ignoring const execution_exception' "$OLOG" >&2 || true
+    rm -f "$OLOG"
+    awk -v version="$VERSION" -v css="$SHARE/style.css" -v svgdir="$OUT/parts" \
+        -v summary="$OUT/summary.tsv" -v stats="$OUT/asn_stats.tsv" \
+        -v edges="$OUT/edges.tsv" -v channels="$OUT/service_channel.tsv" \
+        -v service="$OUT/service_asn.tsv" -v delta="$OUT/delta.tsv" \
+        -v insights="$OUT/insights.tsv" -v blocks="$OUT/big_prefixes.tsv" \
+        -v empty="$OUT/empty.tsv" -v gmeta="$OUT/parts/graph_meta.tsv" \
+        -f "$LIB/build_html.awk" > "$OUT/dashboard.html.tmp"
+    mv "$OUT/dashboard.html.tmp" "$OUT/dashboard.html"
+    say "wrote $OUT/dashboard.html"
+}
+
+report() {
+    [ -f "$OUT/summary.tsv" ] || die "nothing analyzed yet"
+    awk -v summary="$OUT/summary.tsv" -v stats="$OUT/asn_stats.tsv" \
+        -v edges="$OUT/edges.tsv" -v owners="$OUT/owners.tsv" \
+        -v channels="$OUT/service_channel.tsv" -v service="$OUT/service_asn.tsv" \
+        -v delta="$OUT/delta.tsv" -v insights="$OUT/insights.tsv" \
+        -f "$LIB/report.awk" > "$OUT/report.txt"
+    cat "$OUT/report.txt"
+}
+
+CMD=all
+while [ $# -gt 0 ]; do
+    case "$1" in
+        all|refresh|analyze|render|report) CMD=$1 ;;
+        --repo) shift; [ $# -gt 0 ] || die "--repo needs an argument"; REPO_URL=$1 ;;
+        --out)  shift; [ $# -gt 0 ] || die "--out needs an argument";  OUT=$1 ;;
+        --offline) OFFLINE=1 ;;
+        --no-viz) NO_VIZ=1 ;;
+        -V|--version) printf 'asnscope %s\n' "$VERSION"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown argument: $1 (try --help)" ;;
+    esac
+    shift
+done
+
+case "$CMD" in
+    refresh) refresh_repo ;;
+    analyze) analyze; report ;;
+    render)  render ;;
+    report)  report ;;
+    all)
+        refresh_repo
+        analyze
+        report
+        if [ "${NO_VIZ:-0}" -eq 0 ]; then render; else say "skipping visualisation (--no-viz)"; fi
+        ;;
+esac
