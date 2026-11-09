@@ -76,6 +76,41 @@ Options:
 
 Environment overrides: `ASNSCOPE_REPO`, `ASNSCOPE_CACHE`, `ASNSCOPE_OUT`.
 
+## Progress and timing
+
+Every stage now reports itself on stderr. In a terminal the current line is
+updated in place; when stderr is redirected, each stage leaves a start and a
+finish line instead:
+
+```text
+asnscope 0.1.0: 10 steps, rough estimate ~40s
+[ 3/10] merge address ranges        done in 4s  |  run 9s, ~22s left
+[ 5/10] attribute service lists     [############--------] 12/16  2s/est 7s
+```
+
+- The step counter, elapsed time, and the estimate for that step are always
+  visible.
+- Loops that know their item count (`parse ASN lists`, service channels,
+  published tables) draw a bar and the current item number.
+- Single long passes (`git clone`, sorting, pairwise relations, Octave's force
+  layout, `combined_list` attribution) animate a spinner so it is clear the
+  process is alive and how far past its estimate it is.
+- The first run uses conservative built-in estimates. Each completed stage is
+  timed and written to `state/timings.tsv`; later runs use those numbers for
+  the per-step `est` and for the running `~Xs left` figure. A missing clone is
+  always treated as unknown work (a first clone) instead of borrowing a cached
+  update time.
+- Progress goes to stderr only, so `./asnscope report > briefing.txt` still
+  writes just the report. Redirect stderr to silence the progress output.
+
+The report and HTML assembly passes are given an explicit empty input
+(`/dev/null`), so a terminal run cannot stall waiting on stdin after the last
+visible stage.
+
+A cold first run cannot know how long the network clone will take; it says
+"~45s" while cloning about 23 MB, then records the real duration for later
+runs. The rough estimates improve after the first complete run.
+
 ## What it computes
 
 1. **Parse.** Every `AS<number>_<slug>` file is read as IPv4 addresses/CIDRs.
@@ -123,6 +158,7 @@ Environment overrides: `ASNSCOPE_REPO`, `ASNSCOPE_CACHE`, `ASNSCOPE_OUT`.
 | `out/summary.tsv` | Key/value totals used by the report and dashboard. |
 | `out/insights.tsv` | Generated observations. |
 | `state/history.tsv` | One line per run (timestamp, ASNs, prefixes, union, overlap). |
+| `state/timings.tsv` | Per-stage durations from earlier runs, used for progress estimates. |
 
 ## Reading the dashboard
 
@@ -186,16 +222,20 @@ lib/render_dashboard.m  SVG panels and force layout (Octave)
 lib/build_html.awk    inline CSS/SVG into one HTML file
 lib/report.awk        text briefing
 share/style.css       dashboard styles (inlined at build time)
-state/                last snapshot + history (gitignored)
+state/                last snapshot + history + per-step timings (gitignored)
 .cache/               upstream clone (gitignored)
 out/                  generated output (gitignored)
 ```
 
 ## Performance
 
-On the 399 K-row dataset above: analysis ≈ 17 s, Octave rendering ≈ 9 s
-(includes a 760-iteration force layout), first clone excluded. The finished
-dashboard is ~167 KB, of which the inline graph is ~112 KB.
+On the 399 K-row dataset above: analysis ≈ 18–20 s, Octave rendering ≈ 10–12 s
+(includes a 760-iteration force layout), first clone excluded. The progress
+output adds only terminal writes and a few `date` calls; it does not add a data
+pass. The ASN index is derived with shell expansion instead of spawning
+`sed`/`basename` twice per file, which removed a silent multi-second stall of
+its own. The finished dashboard is ~167 KB, of which the inline graph is
+~112 KB.
 
 ## Extending
 

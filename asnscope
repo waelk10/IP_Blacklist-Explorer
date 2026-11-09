@@ -27,8 +27,43 @@ STATE="$SELF_DIR/state"
 OFFLINE=0
 TAB=$(printf '\t')
 
+# --- progress state -------------------------------------------------------
+TTY=0
+PLAN=
+STEP_TOTAL=0
+STEP_INDEX=0
+STEP_ACTIVE=0
+STEP_START=0
+STEP_KEY=
+STEP_LABEL=
+STEP_EXPECTED=0
+SPIN_PID=
+SPIN_TEXT=
+SPIN_LOG=
+TIMINGS=
+TMP=
+OLOG=
+CLONE_TMP=
+RUN_START=0
+
 say()  { printf '%s\n' "$*" >&2; }
-die()  { printf 'asnscope: %s\n' "$*" >&2; exit 1; }
+
+fmt_dur() {
+    if [ "$1" -ge 60 ]; then
+        printf '%dm%02ds' "$(( $1 / 60 ))" "$(( $1 % 60 ))"
+    else
+        printf '%ds' "$1"
+    fi
+}
+
+die() {
+    spinner_stop
+    if [ "$TTY" -eq 1 ]; then
+        printf '\r\033[K' >&2
+    fi
+    printf 'asnscope: %s\n' "$*" >&2
+    exit 1
+}
 
 usage() {
     cat <<EOF
@@ -64,35 +99,359 @@ EOF
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
+# --- progress helpers -----------------------------------------------------
+# All progress goes to stderr, so report/dashboard output stays pipeable.
+# A terminal gets a live bar or spinner; a log gets one line per step.
+
+expected_for() {
+    eval "p_exp=\${TIME_$1:-}"
+    if [ -z "$p_exp" ]; then
+        eval "p_exp=\${DEF_$1:-3}"
+    fi
+    printf '%s' "$p_exp"
+}
+
+load_timings() {
+    [ -n "$TIMINGS" ] || return 0
+    [ -f "$TIMINGS" ] || return 0
+    while IFS="$TAB" read -r p_key p_val; do
+        case "$p_key" in
+            ''|*[!a-z_]*) continue ;;
+        esac
+        case "$p_val" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        eval "TIME_$p_key=$p_val"
+    done < "$TIMINGS"
+}
+
+save_timing() {
+    [ -n "$TIMINGS" ] || return 0
+    p_key=$1
+    p_val=$2
+    eval "TIME_$p_key=$p_val"
+    {
+        if [ -f "$TIMINGS" ]; then
+            grep -v "^$p_key$TAB" "$TIMINGS" || true
+        fi
+        printf '%s\t%s\n' "$p_key" "$p_val"
+    } > "$TIMINGS.new" 2>/dev/null || return 0
+    mv "$TIMINGS.new" "$TIMINGS" 2>/dev/null || rm -f "$TIMINGS.new"
+}
+
+remaining_est() {
+    p_i=0
+    p_sum=0
+    for p_key in $PLAN; do
+        p_i=$((p_i + 1))
+        if [ "$p_i" -le "$STEP_INDEX" ]; then
+            continue
+        fi
+        p_val=$(expected_for "$p_key")
+        p_sum=$((p_sum + p_val))
+    done
+    printf '%s' "$p_sum"
+}
+
+init_progress() {
+    TTY=0
+    if [ -t 2 ]; then
+        TTY=1
+    fi
+    STEP_TOTAL=0
+    STEP_INDEX=0
+    STEP_ACTIVE=0
+    for p_key in $PLAN; do
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    done
+    RUN_START=$(date +%s)
+
+    mkdir -p "$STATE" 2>/dev/null || true
+    if [ -d "$STATE" ] && [ -w "$STATE" ]; then
+        TIMINGS="$STATE/timings.tsv"
+        SPIN_LOG="$STATE/.cmd.$$.log"
+    else
+        TIMINGS=
+        SPIN_LOG="${TMPDIR:-/tmp}/asnscope-cmd.$$.log"
+    fi
+
+    DEF_refresh=45
+    if [ -d "$REPO_DIR/.git" ]; then
+        DEF_refresh=5
+    fi
+    DEF_parse=5
+    DEF_merge=6
+    DEF_relations=3
+    DEF_services=8
+    DEF_delta=2
+    DEF_publish=1
+    DEF_report=1
+    DEF_octave=10
+    DEF_html=1
+
+    load_timings
+    # A stored refresh time describes an existing clone.  If the cache is
+    # gone, this run is a first clone and should say so.
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        TIME_refresh=45
+    fi
+    p_est=0
+    for p_key in $PLAN; do
+        p_val=$(expected_for "$p_key")
+        p_est=$((p_est + p_val))
+    done
+    if [ "$STEP_TOTAL" -gt 1 ]; then
+        if [ -n "$TIMINGS" ] && [ -f "$TIMINGS" ]; then
+            say "asnscope $VERSION: $STEP_TOTAL steps, rough estimate ~$(fmt_dur "$p_est")"
+        else
+            say "asnscope $VERSION: $STEP_TOTAL steps, rough estimate ~$(fmt_dur "$p_est") (first run: estimates are rough)"
+        fi
+    fi
+}
+
+step_begin() {
+    STEP_KEY=$1
+    STEP_LABEL=$2
+    STEP_INDEX=$((STEP_INDEX + 1))
+    STEP_START=$(date +%s)
+    STEP_EXPECTED=$(expected_for "$STEP_KEY")
+    STEP_ACTIVE=1
+    if [ "$TTY" -eq 1 ]; then
+        printf '[%2d/%d] %-26.26s  (est ~%s)\033[K' \
+            "$STEP_INDEX" "$STEP_TOTAL" "$STEP_LABEL" \
+            "$(fmt_dur "$STEP_EXPECTED")" >&2
+    else
+        say "[$STEP_INDEX/$STEP_TOTAL] $STEP_LABEL"
+    fi
+}
+
+step_progress() {
+    [ "$TTY" -eq 1 ] || return 0
+    p_done=$1
+    p_total=$2
+    [ "$p_total" -gt 0 ] || return 0
+    if [ "$p_done" -gt "$p_total" ]; then
+        p_done=$p_total
+    fi
+    p_el=$(( $(date +%s) - STEP_START ))
+    p_fill=$(( p_done * 20 / p_total ))
+    p_bar=
+    p_j=0
+    while [ "$p_j" -lt 20 ]; do
+        if [ "$p_j" -lt "$p_fill" ]; then
+            p_bar="$p_bar#"
+        else
+            p_bar="$p_bar-"
+        fi
+        p_j=$((p_j + 1))
+    done
+    printf '\r[%2d/%d] %-26.26s  [%s] %d/%d  %ss/est %ss\033[K' \
+        "$STEP_INDEX" "$STEP_TOTAL" "$STEP_LABEL" "$p_bar" \
+        "$p_done" "$p_total" "$p_el" "$STEP_EXPECTED" >&2
+}
+
+step_end() {
+    p_note=${1:-}
+    p_now=$(date +%s)
+    p_dur=$((p_now - STEP_START))
+    # An offline refresh says nothing about how long a network fetch takes.
+    if [ "$STEP_KEY" = refresh ] && [ "$OFFLINE" -eq 1 ]; then
+        :
+    else
+        save_timing "$STEP_KEY" "$p_dur"
+    fi
+    STEP_ACTIVE=0
+    p_left=$(remaining_est)
+    p_run=$((p_now - RUN_START))
+    if [ "$TTY" -eq 1 ]; then
+        printf '\r[%2d/%d] %-26.26s  done in %s' \
+            "$STEP_INDEX" "$STEP_TOTAL" "$STEP_LABEL" \
+            "$(fmt_dur "$p_dur")" >&2
+        if [ -n "$p_note" ]; then
+            printf ' (%s)' "$p_note" >&2
+        fi
+        if [ "$STEP_TOTAL" -gt 1 ]; then
+            printf '  |  run %s' "$(fmt_dur "$p_run")" >&2
+            if [ "$p_left" -gt 0 ]; then
+                printf ', ~%s left' "$(fmt_dur "$p_left")" >&2
+            fi
+        fi
+        printf '\033[K\n' >&2
+    else
+        p_msg="[$STEP_INDEX/$STEP_TOTAL] $STEP_LABEL done in $(fmt_dur "$p_dur")"
+        if [ -n "$p_note" ]; then
+            p_msg="$p_msg ($p_note)"
+        fi
+        if [ "$STEP_TOTAL" -gt 1 ]; then
+            p_msg="$p_msg | run $(fmt_dur "$p_run")"
+            if [ "$p_left" -gt 0 ]; then
+                p_msg="$p_msg, ~$(fmt_dur "$p_left") left"
+            fi
+        fi
+        say "$p_msg"
+    fi
+}
+
+clear_line() {
+    if [ "$TTY" -eq 1 ]; then
+        printf '\r\033[K' >&2
+    fi
+}
+
+spinner_start() {
+    [ "$TTY" -eq 1 ] || return 0
+    SPIN_TEXT=$1
+    (
+        p_tick=0
+        while :; do
+            case $((p_tick % 4)) in
+                0) p_frame='|' ;;
+                1) p_frame='/' ;;
+                2) p_frame='-' ;;
+                3) p_frame='\' ;;
+            esac
+            p_el=$(( $(date +%s) - STEP_START ))
+            printf '\r[%2d/%d] %-26.26s  %s %-30.30s %ss/est %ss\033[K' \
+                "$STEP_INDEX" "$STEP_TOTAL" "$STEP_LABEL" "$p_frame" \
+                "$SPIN_TEXT" "$p_el" "$STEP_EXPECTED" >&2
+            p_tick=$((p_tick + 1))
+            sleep 0.25
+        done
+    ) &
+    SPIN_PID=$!
+}
+
+spinner_stop() {
+    if [ -n "${SPIN_PID:-}" ]; then
+        kill "$SPIN_PID" 2>/dev/null || true
+        wait "$SPIN_PID" 2>/dev/null || true
+        SPIN_PID=
+    fi
+}
+
+# Run a quiet command under a spinner.  Its stderr is held back so it cannot
+# tear the progress line; it is printed if the command fails or warns.
+run_cmd() {
+    p_label=$1
+    shift
+    if [ "$TTY" -eq 0 ]; then
+        "$@"
+        return $?
+    fi
+    spinner_start "$p_label"
+    if "$@" 2>"$SPIN_LOG"; then
+        p_rc=0
+    else
+        p_rc=$?
+    fi
+    spinner_stop
+    if [ -s "$SPIN_LOG" ]; then
+        clear_line
+        cat "$SPIN_LOG" >&2
+        : > "$SPIN_LOG"
+    fi
+    return "$p_rc"
+}
+
+# Same, but write stdout to a file (the common awk/sort pass shape).
+run_cmd_out() {
+    p_label=$1
+    p_out=$2
+    shift 2
+    if [ "$TTY" -eq 0 ]; then
+        "$@" > "$p_out"
+        return $?
+    fi
+    spinner_start "$p_label"
+    if "$@" > "$p_out" 2>"$SPIN_LOG"; then
+        p_rc=0
+    else
+        p_rc=$?
+    fi
+    spinner_stop
+    if [ -s "$SPIN_LOG" ]; then
+        clear_line
+        cat "$SPIN_LOG" >&2
+        : > "$SPIN_LOG"
+    fi
+    return "$p_rc"
+}
+
+on_exit() {
+    spinner_stop
+    if [ -n "$TMP" ]; then
+        case "$TMP" in
+            */.tmp.*) rm -rf "$TMP" 2>/dev/null || true ;;
+        esac
+    fi
+    if [ -n "$CLONE_TMP" ]; then
+        case "$CLONE_TMP" in
+            */.clone.*) rm -rf "$CLONE_TMP" 2>/dev/null || true ;;
+        esac
+    fi
+    if [ -n "$OLOG" ]; then
+        rm -f "$OLOG" 2>/dev/null || true
+    fi
+    if [ -n "$SPIN_LOG" ]; then
+        rm -f "$SPIN_LOG" 2>/dev/null || true
+    fi
+    if [ -n "$TIMINGS" ] && [ -f "$TIMINGS.new" ]; then
+        rm -f "$TIMINGS.new" 2>/dev/null || true
+    fi
+}
+trap on_exit 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# --- pipeline -------------------------------------------------------------
 refresh_repo() {
     need git
     mkdir -p "$CACHE"
+    step_begin refresh "refresh upstream clone"
 
     if [ -d "$REPO_DIR/.git" ]; then
         if [ "$OFFLINE" -eq 1 ]; then
-            say "offline: using cached clone"
+            step_end "offline"
             return 0
         fi
-        say "updating $REPO_DIR"
+        spinner_start "fetching upstream changes"
         if git -C "$REPO_DIR" fetch --depth=1 --quiet origin 2>/dev/null; then
             git -C "$REPO_DIR" reset --hard --quiet FETCH_HEAD 2>/dev/null || true
+            spinner_stop
+            step_end
         else
+            spinner_stop
+            clear_line
             say "warning: update failed; using the cached clone"
+            step_end "cached"
         fi
         return 0
     fi
 
-    [ "$OFFLINE" -eq 1 ] && die "no cached clone at $REPO_DIR (run without --offline first)"
-    say "cloning $REPO_URL"
-    rm -rf "$CACHE/.clone.$$"
-    if ! git clone --depth 1 --quiet "$REPO_URL" "$CACHE/.clone.$$"; then
-        rm -rf "$CACHE/.clone.$$"
+    if [ "$OFFLINE" -eq 1 ]; then
+        die "no cached clone at $REPO_DIR (run without --offline first)"
+    fi
+    CLONE_TMP="$CACHE/.clone.$$"
+    rm -rf "$CLONE_TMP"
+    spinner_start "cloning repository (~23 MB)"
+    if ! git clone --depth 1 --quiet "$REPO_URL" "$CLONE_TMP" 2>"$SPIN_LOG"; then
+        spinner_stop
+        clear_line
+        if [ -s "$SPIN_LOG" ]; then
+            cat "$SPIN_LOG" >&2
+        fi
+        rm -rf "$CLONE_TMP"
+        CLONE_TMP=
         die "git clone failed"
     fi
+    spinner_stop
     if [ -e "$REPO_DIR" ]; then
         die "$REPO_DIR exists but is not a git clone; move it away"
     fi
-    mv "$CACHE/.clone.$$" "$REPO_DIR"
+    mv "$CLONE_TMP" "$REPO_DIR"
+    CLONE_TMP=
+    step_end
 }
 
 repo_commit() {
@@ -115,27 +474,58 @@ analyze() {
     rm -rf "$TMP"
     mkdir -p "$TMP"
 
-    say "parsing ASN lists"
+    # --- parse ---------------------------------------------------------
+    step_begin parse "parse ASN lists"
     set -- "$DATA"/AS*
     [ -e "$1" ] || die "no AS* files in $DATA"
-    awk -f "$LIB/extract.awk" "$@" > "$TMP/raw0.tsv"
-    sort -t "$TAB" -k1,1 -k4,4n "$TMP/raw0.tsv" > "$TMP/raw.tsv"
+    : > "$TMP/raw0.tsv"
+    nfiles=$#
+    nfile=0
+    for f in "$@"; do
+        awk -f "$LIB/extract.awk" "$f" >> "$TMP/raw0.tsv"
+        nfile=$((nfile + 1))
+        if [ $((nfile % 4)) -eq 0 ]; then
+            step_progress "$nfile" "$nfiles"
+        fi
+    done
+    step_progress "$nfiles" "$nfiles"
+    step_end
+
+    # --- merge ---------------------------------------------------------
+    step_begin merge "merge address ranges"
+    sort_raw() {
+        sort -t "$TAB" -k1,1 -k4,4n "$TMP/raw0.tsv"
+    }
+    run_cmd_out "sorting prefixes" "$TMP/raw.tsv" sort_raw
     UNIQUE_CIDRS=$(cut -f3 "$TMP/raw.tsv" | sort -u | wc -l | tr -d ' ')
     awk -F'\t' 'BEGIN { OFS = "\t" }
                 { l = $6 + 0; c[l]++; a[l] += $5 - $4 + 1 }
                 END { for (l = 0; l <= 32; l++) if (c[l]) print l, c[l], a[l] }' \
         "$TMP/raw.tsv" > "$TMP/prefix_hist.tsv"
 
-    awk -f "$LIB/merge.awk" \
-        -v merged="$TMP/merged0.tsv" -v meta="$TMP/meta_raw.tsv" "$TMP/raw.tsv"
+    merge_ranges() {
+        awk -f "$LIB/merge.awk" \
+            -v merged="$TMP/merged0.tsv" -v meta="$TMP/meta_raw.tsv" "$TMP/raw.tsv"
+    }
+    run_cmd "merging overlapping prefixes" merge_ranges
 
     # ASN numbers that exist as files but have an empty list still count as
-    # tracked; give them a zero row so the numbers reconcile.
+    # tracked; give them a zero row so the numbers reconcile.  Derive the
+    # number and slug with shell expansion: spawning sed/basename for 200+
+    # files was a noticeable silent stall on its own.
     for f in "$@"; do
-        base=$(basename "$f")
-        asn=$(printf '%s' "$base" | sed -n 's/^AS\([0-9][0-9]*\)_.*/\1/p')
-        slug=$(printf '%s' "$base" | sed -n 's/^AS[0-9][0-9]*_//p')
-        [ -n "$asn" ] && printf '%s\t%s\n' "$asn" "$slug"
+        base=${f##*/}
+        case "$base" in
+            AS[0-9]*_*) ;;
+            *) continue ;;
+        esac
+        rest=${base#AS}
+        asn=${rest%%_*}
+        slug=${rest#*_}
+        case "$asn" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        printf '%s\t%s\n' "$asn" "$slug"
     done | sort -t "$TAB" -u -k1,1 > "$TMP/asns_all.tsv"
 
     cp "$TMP/meta_raw.tsv" "$TMP/meta.tsv"
@@ -144,37 +534,72 @@ analyze() {
         "$TMP/meta_raw.tsv" "$TMP/asns_all.tsv" >> "$TMP/meta.tsv"
     awk -F'\t' '$6 == 0 { print $1 "\t" $2 "\t" $4 }' "$TMP/meta.tsv" > "$TMP/empty.tsv"
 
-    sort -t "$TAB" -k2,2n "$TMP/merged0.tsv" > "$TMP/merged_sorted.tsv"
+    sort_merged() {
+        sort -t "$TAB" -k2,2n "$TMP/merged0.tsv"
+    }
+    run_cmd_out "sorting merged ranges" "$TMP/merged_sorted.tsv" sort_merged
+    step_end
 
-    say "computing coverage and relations"
-    awk -f "$LIB/union.awk" "$TMP/merged_sorted.tsv" > "$TMP/union.txt"
+    # --- union, overlap, relations ------------------------------------
+    step_begin relations "compute coverage/relations"
+    union_pass() {
+        awk -f "$LIB/union.awk" "$TMP/merged_sorted.tsv"
+    }
+    run_cmd_out "measuring address-space union" "$TMP/union.txt" union_pass
     read -r UNION UNION_RANGES < "$TMP/union.txt"
 
-    awk -F'\t' '{ print $2 "\t+1"; print ($3 + 1) "\t-1" }' "$TMP/merged_sorted.tsv" |
-        sort -t "$TAB" -k1,1n -k2,2n |
-        awk -f "$LIB/depth.awk" > "$TMP/depth.txt"
+    depth_pass() {
+        awk -F'\t' '{ print $2 "\t+1"; print ($3 + 1) "\t-1" }' "$TMP/merged_sorted.tsv" |
+            sort -t "$TAB" -k1,1n -k2,2n |
+            awk -f "$LIB/depth.awk"
+    }
+    run_cmd_out "measuring overlap depth" "$TMP/depth.txt" depth_pass
     read -r OVERLAP MAXDEPTH < "$TMP/depth.txt"
 
-    sort -t "$TAB" -k3,3 "$TMP/raw.tsv" | awk -f "$LIB/exact.awk" > "$TMP/exact.tsv"
+    exact_pass() {
+        sort -t "$TAB" -k3,3 "$TMP/raw.tsv" | awk -f "$LIB/exact.awk"
+    }
+    run_cmd_out "finding identical CIDRs" "$TMP/exact.tsv" exact_pass
 
-    awk -v meta="$TMP/meta.tsv" -v exact="$TMP/exact.tsv" -f "$LIB/edges.awk" \
-        "$TMP/merged_sorted.tsv" |
-        sort -t "$TAB" -k3,3nr > "$TMP/edges.tsv"
+    edges_pass() {
+        awk -v meta="$TMP/meta.tsv" -v exact="$TMP/exact.tsv" -f "$LIB/edges.awk" \
+            "$TMP/merged_sorted.tsv" |
+            sort -t "$TAB" -k3,3nr
+    }
+    run_cmd_out "computing pairwise relations" "$TMP/edges.tsv" edges_pass
 
-    awk -v total="$UNION" -f "$LIB/stats.awk" "$TMP/meta.tsv" "$TMP/edges.tsv" |
-        sort -t "$TAB" -k6,6nr |
-        awk -F'\t' 'BEGIN { OFS = "\t" } { print NR, $0 }' > "$TMP/asn_stats.tsv"
+    stats_pass() {
+        awk -v total="$UNION" -f "$LIB/stats.awk" "$TMP/meta.tsv" "$TMP/edges.tsv" |
+            sort -t "$TAB" -k6,6nr |
+            awk -F'\t' 'BEGIN { OFS = "\t" } { print NR, $0 }'
+    }
+    run_cmd_out "ranking ASNs" "$TMP/asn_stats.tsv" stats_pass
 
-    awk -f "$LIB/owners.awk" "$TMP/asn_stats.tsv" |
-        sort -t "$TAB" -k3,3nr > "$TMP/owners.tsv"
+    owners_pass() {
+        awk -f "$LIB/owners.awk" "$TMP/asn_stats.tsv" |
+            sort -t "$TAB" -k3,3nr
+    }
+    run_cmd_out "grouping operators" "$TMP/owners.tsv" owners_pass
+    step_end
 
     # --- service lists -------------------------------------------------
-    say "attributing service lists"
+    step_begin services "attribute service lists"
     : > "$TMP/service_asn.tsv"
     : > "$TMP/service_channel.tsv"
+    nsvc=0
     for f in "$DATA"/*; do
         [ -f "$f" ] || continue
-        base=$(basename "$f")
+        base=${f##*/}
+        case "$base" in
+            AS[0-9]*_*|combined_list|combined_list_no_f2b|timestamp|append_*|*.xz|*.tar*)
+                continue ;;
+        esac
+        nsvc=$((nsvc + 1))
+    done
+    isvc=0
+    for f in "$DATA"/*; do
+        [ -f "$f" ] || continue
+        base=${f##*/}
         case "$base" in
             AS[0-9]*_*|combined_list|combined_list_no_f2b|timestamp|append_*|*.xz|*.tar*)
                 continue ;;
@@ -182,35 +607,55 @@ analyze() {
         awk -v merged="$TMP/merged_sorted.tsv" -v chfile="$TMP/ch.tsv" \
             -f "$LIB/coverage.awk" "$f" >> "$TMP/service_asn.tsv"
         cat "$TMP/ch.tsv" >> "$TMP/service_channel.tsv"
+        isvc=$((isvc + 1))
+        step_progress "$isvc" "$nsvc"
     done
     awk -F'\t' '$2 > 0' "$TMP/service_channel.tsv" > "$TMP/channels.tmp"
     mv "$TMP/channels.tmp" "$TMP/service_channel.tsv"
 
     if [ -f "$DATA/combined_list" ]; then
-        awk -v merged="$TMP/merged_sorted.tsv" -v chfile="$TMP/combined_channel.tsv" \
-            -f "$LIB/coverage.awk" "$DATA/combined_list" > "$TMP/combined_asn.tsv"
+        combined_pass() {
+            awk -v merged="$TMP/merged_sorted.tsv" -v chfile="$TMP/combined_channel.tsv" \
+                -f "$LIB/coverage.awk" "$DATA/combined_list"
+        }
+        clines=$(wc -l < "$DATA/combined_list" | tr -d ' ')
+        run_cmd_out "combined_list: $clines entries" \
+            "$TMP/combined_asn.tsv" combined_pass
     else
         printf 'combined_list\t0\t0\t0.0\n' > "$TMP/combined_channel.tsv"
     fi
+    step_end
 
     # --- comparison with the previous run ------------------------------
+    step_begin delta "compare with previous run"
     : > "$TMP/delta.tsv"
     HAS_PREV=0
     if [ -f "$STATE/last_stats.tsv" ]; then
         HAS_PREV=1
-        awk -f "$LIB/delta.awk" "$STATE/last_stats.tsv" "$TMP/asn_stats.tsv" |
-            awk -F'\t' 'BEGIN { OFS = "\t" } { d = $5; if (d < 0) d = -d; print $0, d }' |
-            sort -t "$TAB" -k9,9nr | cut -f1-8 > "$TMP/delta.tsv"
+        delta_pass() {
+            awk -f "$LIB/delta.awk" "$STATE/last_stats.tsv" "$TMP/asn_stats.tsv" |
+                awk -F'\t' 'BEGIN { OFS = "\t" } { d = $5; if (d < 0) d = -d; print $0, d }' |
+                sort -t "$TAB" -k9,9nr | cut -f1-8
+        }
+        run_cmd_out "diffing previous snapshot" "$TMP/delta.tsv" delta_pass
+        step_end
+    else
+        step_end "first run"
     fi
 
     # --- publish -------------------------------------------------------
+    step_begin publish "publish tables and summary"
+    npub=14
+    ipub=0
     for f in raw.tsv meta.tsv merged_sorted.tsv exact.tsv edges.tsv \
              asn_stats.tsv owners.tsv service_asn.tsv service_channel.tsv \
              combined_channel.tsv combined_asn.tsv delta.tsv prefix_hist.tsv empty.tsv; do
         case "$f" in
-            raw.tsv|merged_sorted.tsv) continue ;;
+            raw.tsv|merged_sorted.tsv) ;;
+            *) if [ -f "$TMP/$f" ]; then cp "$TMP/$f" "$OUT/$f"; fi ;;
         esac
-        [ -f "$TMP/$f" ] && cp "$TMP/$f" "$OUT/$f"
+        ipub=$((ipub + 1))
+        step_progress "$ipub" "$npub"
     done
 
     ASN_TOTAL=$(wc -l < "$TMP/asns_all.tsv" | tr -d ' ')
@@ -263,14 +708,20 @@ analyze() {
         printf 'delta_lost\t%s\n' "$LOST"
     } > "$OUT/summary.tsv"
 
-    awk -F'\t' '{ print ($5 - $4 + 1) "\t" $1 "\t" $2 "\t" $3 }' "$TMP/raw.tsv" |
-        sort -t "$TAB" -k1,1nr | sed -n '1,10p' > "$OUT/big_prefixes.tsv"
+    bigprefix_pass() {
+        awk -F'\t' '{ print ($5 - $4 + 1) "\t" $1 "\t" $2 "\t" $3 }' "$TMP/raw.tsv" |
+            sort -t "$TAB" -k1,1nr | sed -n '1,10p'
+    }
+    run_cmd_out "finding largest prefixes" "$OUT/big_prefixes.tsv" bigprefix_pass
 
-    awk -v summary="$OUT/summary.tsv" -v stats="$OUT/asn_stats.tsv" \
-        -v edges="$OUT/edges.tsv" -v owners="$OUT/owners.tsv" \
-        -v channels="$OUT/service_channel.tsv" -v service="$OUT/service_asn.tsv" \
-        -v bigprefix="$OUT/big_prefixes.tsv" \
-        -f "$LIB/insights.awk" > "$OUT/insights.tsv"
+    insights_pass() {
+        awk -v summary="$OUT/summary.tsv" -v stats="$OUT/asn_stats.tsv" \
+            -v edges="$OUT/edges.tsv" -v owners="$OUT/owners.tsv" \
+            -v channels="$OUT/service_channel.tsv" -v service="$OUT/service_asn.tsv" \
+            -v bigprefix="$OUT/big_prefixes.tsv" \
+            -f "$LIB/insights.awk" /dev/null
+    }
+    run_cmd_out "generating observations" "$OUT/insights.tsv" insights_pass
 
     # state for the next delta
     cp "$TMP/asn_stats.tsv" "$STATE/last_stats.tsv"
@@ -282,8 +733,10 @@ analyze() {
         >> "$STATE/history.tsv"
 
     rm -rf "$TMP"
+    TMP=
+    step_end
 
-    say "analyzed $ASN_ACTIVE active ASNs, $PREFIXES prefixes, $EDGES relation(s)"
+    say "analyzed $ASN_ACTIVE active ASNs, $PREFIXES prefixes, $EDGES relation(s) in $(fmt_dur $(( $(date +%s) - RUN_START )))"
 }
 
 find_octave() {
@@ -299,35 +752,51 @@ find_octave() {
 render() {
     [ -f "$OUT/asn_stats.tsv" ] || die "no analysis in $OUT (run analyze first)"
     OCT=$(find_octave) || die "GNU Octave not found (install octave or use --no-viz)"
-    say "drawing with $OCT"
+    step_begin octave "render dashboard (Octave)"
     OLOG="$OUT/.octave.$$.log"
+    spinner_start "drawing panels (force layout)"
     if ! "$OCT" --quiet --no-window-system --eval \
         "addpath('$LIB'); render_dashboard('$OUT', '$SHARE');" 2>"$OLOG"; then
+        spinner_stop
+        clear_line
         cat "$OLOG" >&2
         rm -f "$OLOG"
         die "Octave rendering failed"
     fi
+    spinner_stop
     # Octave 8.4 on this distribution always emits this line at exit; drop it.
     grep -v 'ignoring const execution_exception' "$OLOG" >&2 || true
     rm -f "$OLOG"
-    awk -v version="$VERSION" -v css="$SHARE/style.css" -v svgdir="$OUT/parts" \
-        -v summary="$OUT/summary.tsv" -v stats="$OUT/asn_stats.tsv" \
-        -v edges="$OUT/edges.tsv" -v channels="$OUT/service_channel.tsv" \
-        -v service="$OUT/service_asn.tsv" -v delta="$OUT/delta.tsv" \
-        -v insights="$OUT/insights.tsv" -v blocks="$OUT/big_prefixes.tsv" \
-        -v empty="$OUT/empty.tsv" -v gmeta="$OUT/parts/graph_meta.tsv" \
-        -f "$LIB/build_html.awk" > "$OUT/dashboard.html.tmp"
+    step_end
+
+    step_begin html "assemble dashboard.html"
+    html_pass() {
+        awk -v version="$VERSION" -v css="$SHARE/style.css" -v svgdir="$OUT/parts" \
+            -v summary="$OUT/summary.tsv" -v stats="$OUT/asn_stats.tsv" \
+            -v edges="$OUT/edges.tsv" -v channels="$OUT/service_channel.tsv" \
+            -v service="$OUT/service_asn.tsv" -v delta="$OUT/delta.tsv" \
+            -v insights="$OUT/insights.tsv" -v blocks="$OUT/big_prefixes.tsv" \
+            -v empty="$OUT/empty.tsv" -v gmeta="$OUT/parts/graph_meta.tsv" \
+            -f "$LIB/build_html.awk" /dev/null
+    }
+    run_cmd_out "inlining CSS and SVG" "$OUT/dashboard.html.tmp" html_pass
     mv "$OUT/dashboard.html.tmp" "$OUT/dashboard.html"
+    step_end
     say "wrote $OUT/dashboard.html"
 }
 
 report() {
     [ -f "$OUT/summary.tsv" ] || die "nothing analyzed yet"
-    awk -v summary="$OUT/summary.tsv" -v stats="$OUT/asn_stats.tsv" \
-        -v edges="$OUT/edges.tsv" -v owners="$OUT/owners.tsv" \
-        -v channels="$OUT/service_channel.tsv" -v service="$OUT/service_asn.tsv" \
-        -v delta="$OUT/delta.tsv" -v insights="$OUT/insights.tsv" \
-        -f "$LIB/report.awk" > "$OUT/report.txt"
+    step_begin report "write text report"
+    report_pass() {
+        awk -v summary="$OUT/summary.tsv" -v stats="$OUT/asn_stats.tsv" \
+            -v edges="$OUT/edges.tsv" -v owners="$OUT/owners.tsv" \
+            -v channels="$OUT/service_channel.tsv" -v service="$OUT/service_asn.tsv" \
+            -v delta="$OUT/delta.tsv" -v insights="$OUT/insights.tsv" \
+            -f "$LIB/report.awk" /dev/null
+    }
+    run_cmd_out "formatting briefing" "$OUT/report.txt" report_pass
+    step_end
     cat "$OUT/report.txt"
 }
 
@@ -347,14 +816,42 @@ while [ $# -gt 0 ]; do
 done
 
 case "$CMD" in
-    refresh) refresh_repo ;;
-    analyze) analyze; report ;;
-    render)  render ;;
-    report)  report ;;
+    refresh)
+        PLAN="refresh"
+        init_progress
+        refresh_repo
+        ;;
+    analyze)
+        PLAN="parse merge relations services delta publish report"
+        init_progress
+        analyze
+        report
+        ;;
+    render)
+        PLAN="octave html"
+        init_progress
+        render
+        ;;
+    report)
+        PLAN="report"
+        init_progress
+        report
+        ;;
     all)
+        if [ "${NO_VIZ:-0}" -eq 0 ]; then
+            PLAN="refresh parse merge relations services delta publish report octave html"
+        else
+            PLAN="refresh parse merge relations services delta publish report"
+        fi
+        init_progress
         refresh_repo
         analyze
         report
-        if [ "${NO_VIZ:-0}" -eq 0 ]; then render; else say "skipping visualisation (--no-viz)"; fi
+        if [ "${NO_VIZ:-0}" -eq 0 ]; then
+            render
+        else
+            say "skipping visualisation (--no-viz)"
+        fi
+        say "completed in $(fmt_dur $(( $(date +%s) - RUN_START )))"
         ;;
 esac
